@@ -40,7 +40,7 @@ driver compatible with CUDA 12.
 
 ```bash
 # Automatically select GPU or CPU.
-./docker_cmd.sh python -c "import jax; print(jax.default_backend(), jax.devices())"
+./docker_cmd.sh 'python -c "import jax; print(jax.default_backend(), jax.devices())"'
 
 # Require GPU execution.
 MCTX_DEVICE=gpu ./docker_jupyter.sh
