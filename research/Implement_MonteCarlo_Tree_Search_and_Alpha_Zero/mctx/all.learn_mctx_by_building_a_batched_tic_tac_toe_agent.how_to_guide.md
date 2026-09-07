@@ -1,7 +1,7 @@
 ---
 title: "Learn Mctx by Building a Batched Tic-Tac-Toe Agent"
 authors:
-  - Eyepatch0
+  - MohammedSyed
   - gpsaggese
 date: 2026-09-06
 description: >
@@ -9,8 +9,10 @@ description: >
   learn how batched JAX models, legal-action masks, and adversarial value
   backup fit together.
 categories:
-  - Reinforcement Learning
-  - Monte Carlo Tree Search
+  - "Reinforcement Learning"
+  - "AI Research"
+  - "Machine Learning"
+  - Python
 ---
 
 TL;DR: This tutorial turns a familiar tic-tac-toe game into the batched model
@@ -27,7 +29,7 @@ By the end of this tutorial you will have:
 - A JAX-native model of tic-tac-toe transitions, wins, draws, and legal moves
 - A batched `mctx.RootFnOutput` and recurrent model
 - A deterministic Mctx player that plugs into the project's existing game loop
-- Full games against random and rollout-MCTS opponents
+- Outcome comparisons of Mctx and rollout MCTS against the same random opponent
 - A synchronized benchmark that separates JIT compilation from search time
 - One Docker image that uses an NVIDIA GPU when available and falls back to CPU
 
@@ -67,6 +69,24 @@ object, it asks for two model components:
 
 - A root containing policy logits, a position value, and a state embedding
 - A recurrent function that predicts the result of taking an action
+
+```mermaid
+flowchart LR
+    S[State batch] --> R[RootFnOutput]
+    R --> M[Mctx search]
+    M --> A[Selected actions]
+    M --> T[Search statistics]
+    M -->|Actions and embeddings| F[Recurrent function]
+    F -->|Rewards, discounts, priors, and values| M
+```
+
+For JAX-based AlphaZero and MuZero research, Mctx is a state-of-the-art
+reference implementation. Google DeepMind's library includes the core search
+algorithms used by AlphaZero, MuZero, and Gumbel MuZero, supports full JIT
+compilation, and searches batches in parallel on accelerators. A handwritten
+Python tree remains easier to inspect one simulation at a time; Mctx is the
+more practical choice when search must share JAX models and scale across many
+positions on a GPU.
 
 Those model components are normally supplied by a MuZero or AlphaZero system.
 For this tutorial, the tic-tac-toe rules provide an exact transition model.
