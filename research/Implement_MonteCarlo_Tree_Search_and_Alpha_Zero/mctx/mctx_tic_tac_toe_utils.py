@@ -92,12 +92,16 @@ def _get_prior_logits(boards: jax.Array) -> jax.Array:
     """
     Assign uniform logits to legal moves and mask every illegal move.
 
+    Terminal boards use finite dummy logits so normalization stays defined.
+    These are absorbing search states, not playable game positions.
+
     :param boards: board embeddings with shape `[batch_size, 9]`
     :return: logits with shape `[batch_size, 9]`
     """
     is_terminal = _is_terminal(boards)
     is_legal = (boards == 0) & ~is_terminal[:, None]
     logits = jnp.where(is_legal, 0.0, -jnp.inf)
+    logits = jnp.where(is_terminal[:, None], 0.0, logits)
     return logits
 
 
@@ -175,6 +179,8 @@ def mctx_recurrent_fn(
     embedding is canonicalized for the opponent. A nonterminal discount of
     `-1` makes value backup switch perspective at every ply; terminal nodes use
     discount `0` because their reward completely determines the outcome.
+    Repeated expansion of a terminal node preserves its board and returns zero
+    reward and discount, making it an absorbing state inside the search tree.
 
     :param params: unused model parameters required by the Mctx API
     :param rng_key: unused PRNG key required by the Mctx API
@@ -183,14 +189,17 @@ def mctx_recurrent_fn(
     :return: `(recurrent_output, next_embeddings)`
     """
     del params, rng_key
+    was_terminal = _is_terminal(embeddings)
     moves = jax.nn.one_hot(actions, NUM_ACTIONS, dtype=embeddings.dtype)
-    boards_after_move = embeddings + moves
+    boards_after_move = embeddings + jnp.where(was_terminal[:, None], 0, moves)
     player_won = _has_winning_line(boards_after_move, 1)
     board_is_full = jnp.all(boards_after_move != 0, axis=-1)
-    is_terminal = player_won | board_is_full
-    rewards = player_won.astype(jnp.float32)
+    is_terminal = was_terminal | player_won | board_is_full
+    rewards = (player_won & ~was_terminal).astype(jnp.float32)
     discounts = jnp.where(is_terminal, 0.0, -1.0).astype(jnp.float32)
-    next_embeddings = -boards_after_move
+    next_embeddings = jnp.where(
+        was_terminal[:, None], embeddings, -boards_after_move
+    )
     recurrent_output = mctx.RecurrentFnOutput(
         reward=rewards,
         discount=discounts,
