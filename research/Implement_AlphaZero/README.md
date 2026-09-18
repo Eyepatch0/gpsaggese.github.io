@@ -7,7 +7,7 @@ each function through a complete hand-played Tic-Tac-Toe game.
 The project reuses the `Game` interface and board games from the
 [MCTS project](../Implement_MonteCarlo_Tree_Search_and_Alpha_Zero/README.md).
 Game rules remain separate from the representation utilities. Start with
-`alphazero_utils.py`, then explore the paired API notebook.
+`alphazero_utils.py`, then explore the API notebook.
 
 ## Structure of the Directory
 
@@ -21,7 +21,6 @@ Game rules remain separate from the representation utilities. Start with
 | :--- | :--- |
 | `alphazero_utils.py` | Player-relative encoding, legal-action mask, and exact terminal value |
 | `alphazero.API.ipynb` | Guided API tour and a hand-played Tic-Tac-Toe example |
-| `alphazero.API.py` | Jupytext percent-format source paired with the notebook |
 | `test/test_alphazero_utils.py` | Core representation and game-integration tests |
 | `test/test_docker_template.py` | Docker build/script checks and notebook execution using shared helpers |
 | `requirements.txt` | Reference requirements plus `pytest<9` for the shared test hooks |
@@ -62,7 +61,7 @@ from the repository root. The `>` characters below denote shell prompts.
 
   ```bash
   > python -m pip install -r research/Implement_AlphaZero/requirements.txt \
-      jupyterlab jupytext
+      jupyterlab
   > export PYTHONPATH="$PWD:$PWD/helpers_root${PYTHONPATH:+:$PYTHONPATH}"
   > export MPLBACKEND=Agg
   ```
@@ -77,10 +76,9 @@ from the repository root. The `>` characters below denote shell prompts.
   The override avoids requiring the optional `--new-first` pytest plugin.
   Keep the root `conftest.py` enabled: the shared test base uses its fixtures.
 
-- Run the example as Python or open the paired notebook:
+- Open the API notebook:
 
   ```bash
-  > python research/Implement_AlphaZero/alphazero.API.py
   > jupyter lab research/Implement_AlphaZero/alphazero.API.ipynb
   ```
 
@@ -90,12 +88,6 @@ from the repository root. The `>` characters below denote shell prompts.
   > jupyter nbconvert --to notebook --execute \
       research/Implement_AlphaZero/alphazero.API.ipynb \
       --output alphazero.API.executed.ipynb --output-dir /tmp
-  ```
-
-- Synchronize notebook edits with the paired Python file:
-
-  ```bash
-  > jupytext --sync research/Implement_AlphaZero/alphazero.API.ipynb
   ```
 
 ## Docker Commands
@@ -148,10 +140,9 @@ for additional script options.
 | :--- | :--- |
 | Core tests in the local development environment | 15 passed |
 | Core tests in the built CPU image | 15 passed |
-| Paired Python example | Completed with all embedded checks passing |
 | Notebook execution in fresh local and Docker kernels | Passed |
 | Docker integration checks | Build, shell, command, and notebook checks passed |
-| Notebook schema and paired cell sources | Valid and synchronized |
+| Notebook schema | Valid |
 | Python formatting, shell syntax, and symlink targets | Passed |
 
 The shared helpers emit deprecation warnings for `datetime.utcnow()` and the
