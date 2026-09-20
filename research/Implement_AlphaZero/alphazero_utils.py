@@ -1,17 +1,21 @@
 """
-Represent board games as inputs and outcomes for AlphaZero.
+Represent and evaluate board games for AlphaZero.
 
 States remain the immutable tuples owned by the game implementations. Encodings
 are model inputs only: never pass an encoded board back to the game rules.
 Callers supply reachable states and legal moves from the existing game API.
+Evaluators return legal action priors and player-to-move values; terminal
+states have an all-zero policy and an exact outcome.
 
 Import as:
 
 import research.Implement_AlphaZero.alphazero_utils as rialzut
 """
 
+import dataclasses
 import logging
-from typing import Optional
+import numbers
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -93,3 +97,156 @@ def get_terminal_value(
         value = float(game.get_winner(state) * game.get_current_player(state))
     _LOG.debug("Terminal value='%s'", value)
     return value
+
+
+# #############################################################################
+# Policy normalization
+# #############################################################################
+
+
+def _as_policy_array(policy: np.ndarray) -> np.ndarray:
+    """
+    Copy a finite, nonnegative weight vector into floating-point storage.
+
+    :param policy: nonempty one-dimensional real weights, not logits
+    :return: independent `float64` array with validated weights
+    """
+    hdbg.dassert(np.isrealobj(policy), "Policy weights must be real")
+    weights = np.array(policy, dtype=np.float64, copy=True)
+    hdbg.dassert_eq(weights.ndim, 1, "Policy must be a flat action vector")
+    hdbg.dassert_lt(0, weights.size, "The action space must be nonempty")
+    hdbg.dassert(np.isfinite(weights).all(), "Policy weights must be finite")
+    hdbg.dassert((weights >= 0).all(), "Policy weights must be nonnegative")
+    return weights
+
+
+def normalize_policy(
+    policy: np.ndarray, legal_action_mask: np.ndarray
+) -> np.ndarray:
+    """
+    Mask illegal actions and normalize nonnegative weights over legal actions.
+
+    For example, weights `[2, 9, 1]` and mask `[True, False, True]` yield
+    `[2/3, 0, 1/3]`. Inputs are not modified. All weights, including illegal
+    entries, must be finite and nonnegative; logits require conversion to
+    weights before calling this function.
+
+    :param policy: nonempty flat real weight vector
+    :param legal_action_mask: boolean vector of the same shape
+    :return: fresh `float64` probability vector; uniform over legal actions
+        if their total weight is zero, or all zeros if no actions are legal
+    """
+    _LOG.debug("Normalizing policy with shape='%s'", np.shape(policy))
+    weights = _as_policy_array(policy)
+    mask = np.asarray(legal_action_mask)
+    hdbg.dassert_eq(mask.dtype, np.dtype(bool), "Legality must be boolean")
+    hdbg.dassert_eq(mask.shape, weights.shape, "Mask must match action space")
+    # Scale by the largest legal weight before summing to avoid overflow.
+    normalized = np.where(mask, weights, 0.0)
+    scale = normalized.max()
+    if scale > 0:
+        normalized /= scale
+        normalized /= normalized.sum()
+    elif mask.any():
+        # Zero legal mass carries no preference; use a uniform legal prior.
+        normalized = mask.astype(np.float64) / np.count_nonzero(mask)
+    # With no legal moves, the zero vector represents absence of a policy.
+    return normalized
+
+
+# #############################################################################
+# PolicyValuePrediction
+# #############################################################################
+
+
+@dataclasses.dataclass
+class PolicyValuePrediction:
+    """
+    Hold an action policy and a scalar value for the player to move.
+
+    `policy` is a nonempty flat vector summing to one, or all zeros for a
+    terminal state. `value` is a finite real number in `[-1, 1]`. The
+    constructor validates these numerical constraints and owns a copy of the
+    policy. The evaluator is responsible for game-specific legality and for
+    using the zero policy only at terminality.
+    """
+
+    policy: np.ndarray
+    value: float
+
+    def __post_init__(self) -> None:
+        """
+        Validate the prediction at the evaluator output boundary.
+        """
+        self.policy = _as_policy_array(self.policy)
+        # A normalized policy cannot contain an entry greater than one.
+        hdbg.dassert((self.policy <= 1).all(), "Probabilities must be <= 1")
+        mass = self.policy.sum()
+        hdbg.dassert(
+            mass == 0 or np.isclose(mass, 1.0, rtol=1e-6, atol=1e-8),
+            "Policy must sum to one, or be zero at terminality",
+        )
+        hdbg.dassert_isinstance(
+            self.value, numbers.Real, "Value must be scalar"
+        )
+        hdbg.dassert(np.isfinite(self.value), "Value must be finite")
+        hdbg.dassert_lte(-1.0, self.value, "Value cannot be below a loss")
+        hdbg.dassert_lte(self.value, 1.0, "Value cannot exceed a win")
+        self.value = float(self.value)
+
+
+# Evaluators share one signature; consumers need not know how values are obtained.
+PolicyValueEvaluator = Callable[
+    [rimtsaazg.Game, rimtsaazg.State], PolicyValuePrediction
+]
+
+
+# #############################################################################
+# UniformEvaluator
+# #############################################################################
+
+
+class UniformEvaluator:
+    """
+    Return uniform legal priors and a neutral estimate for unfinished games.
+
+    The neutral value `0.0` expresses no preference; it does not assert that
+    the game will draw. Terminal values instead come directly from the rules.
+    This baseline performs no search, random sampling, or learning.
+    """
+
+    def __init__(self, action_size: int) -> None:
+        """
+        Set the fixed action space used by every prediction.
+
+        :param action_size: positive action count, e.g., 9 cells for
+            Tic-Tac-Toe or 7 columns for Connect Four
+        """
+        hdbg.dassert_isinstance(
+            action_size, int, "Action count must be an integer"
+        )
+        hdbg.dassert_lt(0, action_size, "The action space must be nonempty")
+        self.action_size = action_size
+
+    def __call__(
+        self, game: rimtsaazg.Game, state: rimtsaazg.State
+    ) -> PolicyValuePrediction:
+        """
+        Evaluate a reachable state using the game's original representation.
+
+        :param game: rules with integer actions and players `1` and `-1`
+        :param state: original game state, not a player-relative encoding
+        :return: legal policy and player-to-move value; terminal predictions
+            have an all-zero policy and the exact game outcome
+        """
+        _LOG.debug("Evaluating state='%s'", state)
+        mask = get_legal_action_mask(game, state, self.action_size)
+        value = get_terminal_value(game, state)
+        if value is None:
+            hdbg.dassert(
+                mask.any(), "An unfinished game must have a legal action"
+            )
+            value = 0.0
+        policy = normalize_policy(np.ones(self.action_size), mask)
+        prediction = PolicyValuePrediction(policy, value)
+        return prediction

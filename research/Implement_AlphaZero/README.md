@@ -1,13 +1,14 @@
 # Implement AlphaZero
 
-Game representations for AlphaZero: player-relative board encodings,
-legal-action masks, and exact terminal outcomes. The API notebook explains
-each function through a complete hand-played Tic-Tac-Toe game.
+Game representations and policy/value evaluation for AlphaZero: player-relative
+board encodings, legal-action masks, action priors, and terminal outcomes.
+The API notebook explains these components with small Tic-Tac-Toe examples.
 
 The project reuses the `Game` interface and board games from the
 [MCTS project](../Implement_MonteCarlo_Tree_Search_and_Alpha_Zero/README.md).
-Game rules remain separate from the representation utilities. Start with
-`alphazero_utils.py`, then explore the API notebook.
+Game rules remain separate from representation and evaluation. All AlphaZero
+implementation lives in `alphazero_utils.py`. The single `alphazero.API.ipynb`
+tutorial covers board conventions, policy normalization, and the uniform evaluator.
 
 ## Structure of the Directory
 
@@ -19,9 +20,9 @@ Game rules remain separate from the representation utilities. Start with
 
 | File | Description |
 | :--- | :--- |
-| `alphazero_utils.py` | Player-relative encoding, legal-action mask, and exact terminal value |
-| `alphazero.API.ipynb` | Guided API tour and a hand-played Tic-Tac-Toe example |
-| `test/test_alphazero_utils.py` | Core representation and game-integration tests |
+| `alphazero_utils.py` | Board representations, prediction contract, policy normalization, and uniform evaluation |
+| `alphazero.API.ipynb` | Guided tour of game representations and policy/value evaluation |
+| `test/test_alphazero_utils.py` | Core representation, policy normalization, and evaluator tests |
 | `test/test_docker_template.py` | Docker build/script checks and notebook execution using shared helpers |
 | `requirements.txt` | Reference requirements plus `pytest<9` for the shared test hooks |
 | `Dockerfile` | Python 3.12 slim CPU image with Jupyter and project dependencies |
@@ -51,6 +52,45 @@ After X wins, the existing turn convention reports O as next, so the value
 is `-1.0`. After O wins, it likewise reports `-1.0` for X. A draw is `0.0`.
 Alternating-player search negates values between child and parent.
 This convention differs from the existing MCTS node's incoming-player values.
+
+## Policy/Value Evaluation
+
+An evaluator accepts `(game, state)` and returns a `PolicyValuePrediction`.
+The `PolicyValueEvaluator` type alias describes this callable signature.
+Pass the game's original state, just as with the representation utilities.
+
+| API | Output or behavior |
+| :--- | :--- |
+| `normalize_policy(weights, legal_action_mask)` | Fresh `float64` legal probabilities from finite nonnegative weights |
+| `PolicyValuePrediction(policy, value)` | Validated policy vector and finite scalar value in `[-1, 1]` |
+| `UniformEvaluator(action_size)` | Callable baseline with equal legal priors and neutral nonterminal values |
+
+The normalizer masks illegal actions before summing legal weights. It uses
+uniform legal probabilities if their mass is zero, and an all-zero vector
+if no action is legal. Scaling by the largest legal weight keeps normalization
+finite even when a direct sum would overflow. Inputs are never modified.
+Weights must be nonnegative; raw network logits are not accepted.
+
+The prediction constructor checks numerical constraints and copies its policy.
+The evaluator ensures that priors match the fixed action space, assign zero
+probability to illegal actions, and sum to one for unfinished games. A terminal
+prediction instead has an all-zero policy and an exact player-to-move outcome.
+Do not sample a move from a terminal policy.
+
+`UniformEvaluator` returns `0.0` for unfinished games as a neutral estimate,
+not a claim that the game will draw. It uses the exact outcome at terminality:
+after either player wins at Tic-Tac-Toe, the next player has value `-1.0`.
+This deterministic baseline performs no search, random sampling, or learning.
+
+```python
+import research.Implement_AlphaZero.alphazero_utils as rialzut
+import research.Implement_MonteCarlo_Tree_Search_and_Alpha_Zero.game_examples as rimtsaazge
+
+game = rimtsaazge.TicTacToe()
+evaluator = rialzut.UniformEvaluator(9)
+prediction = evaluator(game, game.get_initial_state())
+# prediction.policy has nine entries of 1/9; prediction.value is 0.0.
+```
 
 ## Run Locally
 
@@ -138,12 +178,16 @@ for additional script options.
 
 | Check | Result |
 | :--- | :--- |
-| Core tests in the local development environment | 15 passed |
-| Core tests in the built CPU image | 15 passed |
+| Core tests in the local development environment | 37 passed: 15 representation and 22 evaluator tests |
+| Core tests in the built CPU image | 37 passed |
 | Notebook execution in fresh local and Docker kernels | Passed |
 | Docker integration checks | Build, shell, command, and notebook checks passed |
 | Notebook schema | Valid |
 | Python formatting, shell syntax, and symlink targets | Passed |
+
+Evaluator tests cover legal masking, uniform fallback, large and small finite
+weights, malformed predictions, independent output arrays, terminal outcomes,
+and the different action spaces of Tic-Tac-Toe and Connect Four.
 
 The shared helpers emit deprecation warnings for `datetime.utcnow()` and the
 root pytest hook's legacy `path` argument. The latter is why this project's
