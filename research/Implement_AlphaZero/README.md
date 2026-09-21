@@ -1,14 +1,15 @@
 # Implement AlphaZero
 
-Game representations and policy/value evaluation for AlphaZero: player-relative
-board encodings, legal-action masks, action priors, and terminal outcomes.
-The API notebook explains these components with small Tic-Tac-Toe examples.
+Game representations, policy/value evaluation, and PUCT search for AlphaZero.
+The API notebook explains board encodings, legal priors, terminal outcomes,
+search statistics, and action selection with small Tic-Tac-Toe examples.
 
 The project reuses the `Game` interface and board games from the
 [MCTS project](../Implement_MonteCarlo_Tree_Search_and_Alpha_Zero/README.md).
 Game rules remain separate from representation and evaluation. All AlphaZero
 implementation lives in `alphazero_utils.py`. The single `alphazero.API.ipynb`
-tutorial covers board conventions, policy normalization, and the uniform evaluator.
+tutorial progresses from board conventions and the uniform evaluator to
+hand-traced search and a complete game played by search.
 
 ## Structure of the Directory
 
@@ -20,9 +21,9 @@ tutorial covers board conventions, policy normalization, and the uniform evaluat
 
 | File | Description |
 | :--- | :--- |
-| `alphazero_utils.py` | Board representations, prediction contract, policy normalization, and uniform evaluation |
-| `alphazero.API.ipynb` | Guided tour of game representations and policy/value evaluation |
-| `test/test_alphazero_utils.py` | Core representation, policy normalization, and evaluator tests |
+| `alphazero_utils.py` | Board representations, policy/value evaluation, PUCT trees, and visit policies |
+| `alphazero.API.ipynb` | Guided API tour with search traces, tactical positions, and a complete game |
+| `test/test_alphazero_utils.py` | Representation, evaluation, search mechanics, and tactical tests |
 | `test/test_docker_template.py` | Docker build/script checks and notebook execution using shared helpers |
 | `requirements.txt` | Reference requirements plus `pytest<9` for the shared test hooks |
 | `Dockerfile` | Python 3.12 slim CPU image with Jupyter and project dependencies |
@@ -91,6 +92,61 @@ evaluator = rialzut.UniformEvaluator(9)
 prediction = evaluator(game, game.get_initial_state())
 # prediction.policy has nine entries of 1/9; prediction.value is 0.0.
 ```
+
+## PUCT Search
+
+`build_search_tree()` searches a reachable nonterminal position using the
+supplied evaluator. It supports strictly alternating two-player, zero-sum,
+deterministic games with the existing integer-action interface. The sign
+convention does not apply to extra-turn or single-player games.
+
+| API | Behavior |
+| :--- | :--- |
+| `AlphaZeroNode(state, prior)` | Holds state, incoming prior, children, visit count, and value sum |
+| `get_puct_scores(node, exploration_constant)` | Returns each child's selection score from the parent's perspective |
+| `build_search_tree(game, state, evaluator, action_size=..., num_simulations=...)` | Builds a fresh tree and returns its root |
+| `get_visit_policy(root, action_size)` | Normalizes root child visits into a fixed-size policy |
+
+Selection scores an action as
+`-child.mean_value + c * child.prior * sqrt(max(1, parent.visit_count)) / (1 + child.visit_count)`.
+The child mean is negated because it favors the opponent. The count floor of
+one makes the first selection honor the priors. Unvisited children have mean
+zero, and equal scores choose the lowest action index. Zero-prior actions are
+legal children, but receive no exploration bonus; PUCT does not guarantee
+that every action will be visited within a finite budget.
+
+Root expansion evaluates the current state and creates all legal children
+before the counted simulations. Its initial value estimate is not backed up.
+Each simulation descends to a leaf, expands it if unfinished, and backs up a
+value with alternating signs. Exact terminal outcomes bypass the evaluator.
+Nonterminal priors are masked and normalized before expansion. Search performs
+no random rollouts, training, or root-noise sampling.
+
+Root visits and the sum of root child visits both equal `num_simulations`.
+A nonroot node's first visit evaluates that node without selecting one of
+its children; its own count therefore need not equal its children's counts.
+With zero simulations, `get_visit_policy()` returns the root priors. With
+positive simulations, it returns normalized child counts, which can be used
+with `np.argmax()` to choose the most-visited action. Terminal roots are
+rejected; check `game.is_terminal()` before requesting another move.
+
+```python
+import numpy as np
+
+state = (1, 1, 0, -1, -1, 0, 0, 0, 0)
+root = rialzut.build_search_tree(
+    game, state, evaluator, action_size=9, num_simulations=100
+)
+policy = rialzut.get_visit_policy(root, 9)
+move = int(np.argmax(policy))
+# X selects action 2, completing the top row.
+```
+
+The uniform evaluator supplies neutral estimates at unfinished leaves. Search
+can discover tactical outcomes by reaching terminal positions, but a finite
+budget does not guarantee optimal play. Repeating a search with the same
+deterministic evaluator and configuration produces the same result. Each
+call builds a new tree; it does not retain statistics across moves.
 
 ## Run Locally
 
@@ -178,8 +234,8 @@ for additional script options.
 
 | Check | Result |
 | :--- | :--- |
-| Core tests in the local development environment | 37 passed: 15 representation and 22 evaluator tests |
-| Core tests in the built CPU image | 37 passed |
+| Core tests in the local development environment | 60 passed: 15 representation, 22 evaluator, and 23 search tests |
+| Core tests in the built CPU image | 60 passed |
 | Notebook execution in fresh local and Docker kernels | Passed |
 | Docker integration checks | Build, shell, command, and notebook checks passed |
 | Notebook schema | Valid |
@@ -188,6 +244,10 @@ for additional script options.
 Evaluator tests cover legal masking, uniform fallback, large and small finite
 weights, malformed predictions, independent output arrays, terminal outcomes,
 and the different action spaces of Tic-Tac-Toe and Connect Four.
+Search tests cover hand-computed PUCT scores, one- and two-ply backups,
+terminal evaluator bypass, simulation accounting, zero-budget priors,
+determinism, action masking, and immediate wins and forced blocks for both
+players. The notebook also executes a complete game with uniform-prior search.
 
 The shared helpers emit deprecation warnings for `datetime.utcnow()` and the
 root pytest hook's legacy `path` argument. The latter is why this project's
