@@ -1,5 +1,5 @@
 """
-Represent, evaluate, and search board games with policy/value-guided PUCT.
+Represent, learn, evaluate, and search with a policy/value network and PUCT.
 
 States remain the immutable tuples owned by the game implementations. Encodings
 are model inputs only: never pass an encoded board back to the game rules.
@@ -8,6 +8,7 @@ Evaluators return legal action priors and player-to-move values; terminal
 states have an all-zero policy and an exact outcome.
 Search stores values in each node's player-to-move perspective and negates
 them between parent and child in strictly alternating two-player games.
+Supervised minibatches train a CPU MLP on fixed policy and value targets.
 
 Import as:
 
@@ -18,9 +19,12 @@ import dataclasses
 import logging
 import math
 import numbers
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import helpers.hdbg as hdbg
 import research.Implement_MonteCarlo_Tree_Search_and_Alpha_Zero.game as rimtsaazg
@@ -471,3 +475,238 @@ def get_visit_policy(root: AlphaZeroNode, action_size: int) -> np.ndarray:
     weights = counts if counts.any() else priors
     policy = normalize_policy(weights, mask)
     return policy
+
+
+# #############################################################################
+# PolicyValueNetwork
+# #############################################################################
+
+
+class PolicyValueNetwork(nn.Module):
+    """
+    Map current-player board encodings to policy logits and bounded values.
+
+    Two shared ReLU layers feed a linear policy head and a tanh value head.
+    This small CPU float32 MLP has no dropout or batch normalization, so
+    predictions are identical in training and evaluation modes. Initialization
+    uses a local seed without consuming the caller's CPU random stream.
+    """
+
+    def __init__(
+        self, input_size: int, action_size: int, *, hidden_size: int, seed: int
+    ) -> None:
+        """
+        Build a reproducible network with independent input and action sizes.
+
+        :param input_size: flat board size, e.g., 9 or 42
+        :param action_size: fixed action count, e.g., 9 or 7
+        :param hidden_size: positive width of both shared hidden layers
+        :param seed: CPU initialization seed
+        """
+        super().__init__()
+        for size in (input_size, action_size, hidden_size):
+            hdbg.dassert_isinstance(size, int, "Layer sizes must be integers")
+            hdbg.dassert_lt(0, size, "Layer sizes must be positive")
+        self.input_size = input_size
+        self.action_size = action_size
+        self.hidden_size = hidden_size
+        # Restore the caller's CPU RNG state when initialization finishes.
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(seed)
+            layer_options = {"device": "cpu", "dtype": torch.float32}
+            self.trunk = nn.Sequential(
+                nn.Linear(input_size, hidden_size, **layer_options),
+                nn.ReLU(),
+                nn.Linear(hidden_size, hidden_size, **layer_options),
+                nn.ReLU(),
+            )
+            self.policy_head = nn.Linear(
+                hidden_size, action_size, **layer_options
+            )
+            self.value_head = nn.Linear(hidden_size, 1, **layer_options)
+
+    def forward(
+        self, encoded_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict raw action logits and values without applying game rules.
+
+        :param encoded_states: finite CPU float32 tensor of shape
+            `(input_size,)` or `(batch_size, input_size)`
+        :return: logits of shape `(action_size,)` or `(batch_size, action_size)`
+            and tanh values of shape `()` or `(batch_size,)`, respectively;
+            autograd remains available for training
+        """
+        hdbg.dassert_in(encoded_states.ndim, (1, 2), "Use a board or a batch")
+        hdbg.dassert_eq(
+            encoded_states.shape[-1], self.input_size, "Wrong board size"
+        )
+        hdbg.dassert_eq(encoded_states.device.type, "cpu", "Use CPU inputs")
+        hdbg.dassert_eq(encoded_states.dtype, torch.float32, "Use float32")
+        hdbg.dassert(
+            torch.isfinite(encoded_states).all().item(), "Inputs must be finite"
+        )
+        features = self.trunk(encoded_states)
+        logits = self.policy_head(features)
+        values = torch.tanh(self.value_head(features)).squeeze(-1)
+        return logits, values
+
+
+# #############################################################################
+# NetworkEvaluator
+# #############################################################################
+
+
+class NetworkEvaluator:
+    """
+    Adapt a CPU network to the game's policy/value evaluator contract.
+
+    Retain the model by reference, so later optimizer steps affect predictions.
+    Inference builds no gradient graph and does not change model mode or grads.
+    Terminal states bypass the network and use the exact game outcome.
+    """
+
+    def __init__(self, network: PolicyValueNetwork) -> None:
+        """
+        Wrap a network whose dimensions match the intended game.
+
+        :param network: CPU float32 model with board and action dimensions
+        """
+        self.network = network
+
+    def __call__(
+        self, game: rimtsaazg.Game, state: rimtsaazg.State
+    ) -> PolicyValuePrediction:
+        """
+        Encode a state, mask logits, and return legal priors and a value.
+
+        Mask before softmax: even an enormous illegal logit must not erase
+        the relative probabilities of legal actions through underflow.
+
+        :param game: rules providing legal integer action indices
+        :param state: reachable original state, not an encoded board
+        :return: fresh legal policy and player-to-move value; terminal
+            predictions contain zero policy and the exact outcome
+        """
+        action_size = self.network.action_size
+        value = get_terminal_value(game, state)
+        if value is not None:
+            return PolicyValuePrediction(np.zeros(action_size), value)
+        mask = get_legal_action_mask(game, state, action_size)
+        hdbg.dassert(mask.any(), "An unfinished game needs a legal action")
+        encoded = torch.from_numpy(encode_state(game, state))
+        with torch.inference_mode():
+            logits, predicted_value = self.network(encoded)
+            hdbg.dassert(
+                torch.isfinite(logits).all().item(), "Logits must be finite"
+            )
+            # Float64 softmax preserves differences between large finite logits.
+            masked_logits = logits.to(torch.float64).masked_fill(
+                ~torch.from_numpy(mask), -torch.inf
+            )
+            policy = torch.softmax(masked_logits, dim=-1).numpy()
+            value = predicted_value.item()
+        return PolicyValuePrediction(policy, value)
+
+
+# #############################################################################
+# Supervised minibatch learning
+# #############################################################################
+
+
+def train_batch(
+    network: PolicyValueNetwork,
+    optimizer: torch.optim.Optimizer,
+    encoded_states: np.ndarray,
+    target_policies: np.ndarray,
+    target_values: np.ndarray,
+    *,
+    l2_coefficient: float,
+) -> Dict[str, float]:
+    """
+    Take one optimizer step on fixed policy/value targets.
+
+    The objective is mean policy cross-entropy plus mean squared value error
+    plus `l2_coefficient * sum(parameter ** 2)`, including biases. Policy
+    cross-entropy uses unmasked logits over every action; illegal actions
+    should have zero target mass. This penalizes probability assigned to them.
+    The function receives encodings, not rules, so callers ensure target
+    legality. Terminal all-zero policies are not training distributions.
+
+    :param network: CPU float32 model to update
+    :param optimizer: optimizer over this model's parameters; reuse between
+        calls to preserve momentum; set weight decay to zero because L2 is
+        included explicitly in the objective
+    :param encoded_states: nonempty array `(batch_size, input_size)` with
+        current-player encodings; inputs are copied and never modified
+    :param target_policies: finite nonnegative distributions of shape
+        `(batch_size, action_size)`, each summing to one; soft targets allowed
+    :param target_values: finite player-to-move labels `(batch_size,)` in
+        `[-1, 1]`, not values from a fixed player's perspective
+    :param l2_coefficient: finite nonnegative regularization coefficient
+    :return: pre-update `loss`, `policy_loss`, `value_loss`, and weighted
+        `l2_loss` as Python floats; gradients remain available for inspection
+    """
+    hdbg.dassert(
+        np.isfinite(l2_coefficient) and l2_coefficient >= 0,
+        "L2 coefficient must be finite and nonnegative",
+    )
+    # Copy at the boundary: caller arrays cannot be mutated by the optimizer.
+    arrays = []
+    for data in (encoded_states, target_policies, target_values):
+        hdbg.dassert(np.isrealobj(data), "Training arrays must be real")
+        copied = np.array(data, dtype=np.float32, copy=True)
+        hdbg.dassert(
+            np.isfinite(copied).all(), "Training arrays must be finite"
+        )
+        arrays.append(torch.from_numpy(copied))
+    states, policies, values = arrays
+    hdbg.dassert_eq(states.ndim, 2, "Training requires a batch of boards")
+    batch_size = states.shape[0]
+    hdbg.dassert_lt(0, batch_size, "Training batch must be nonempty")
+    hdbg.dassert_eq(
+        states.shape[1], network.input_size, "Wrong training board size"
+    )
+    hdbg.dassert_eq(
+        tuple(policies.shape),
+        (batch_size, network.action_size),
+        "Policy targets must match the batch and action space",
+    )
+    hdbg.dassert_eq(
+        tuple(values.shape), (batch_size,), "Values need one label per board"
+    )
+    hdbg.dassert((policies >= 0).all().item(), "Targets must be nonnegative")
+    hdbg.dassert(
+        torch.allclose(policies.sum(dim=1), torch.ones(batch_size), atol=1e-6),
+        "Each target policy must sum to one",
+    )
+    hdbg.dassert((values.abs() <= 1).all().item(), "Values must lie in [-1, 1]")
+    # Stable log-softmax handles soft distributions without taking log(0).
+    logits, predicted_values = network(states)
+    policy_loss = -(policies * F.log_softmax(logits, dim=-1)).sum(dim=1).mean()
+    value_loss = F.mse_loss(predicted_values, values)
+    l2_loss = l2_coefficient * sum(
+        parameter.square().sum() for parameter in network.parameters()
+    )
+    loss = policy_loss + value_loss + l2_loss
+    hdbg.dassert(torch.isfinite(loss).item(), "Training loss must be finite")
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    # Fail before updating if invalid gradients would corrupt the parameters.
+    for parameter in network.parameters():
+        hdbg.dassert_is_not(
+            parameter.grad, None, "Every parameter needs a gradient"
+        )
+        hdbg.dassert(
+            torch.isfinite(parameter.grad).all().item(),
+            "Gradients must be finite",
+        )
+    optimizer.step()
+    metrics = {
+        "loss": loss.item(),
+        "policy_loss": policy_loss.item(),
+        "value_loss": value_loss.item(),
+        "l2_loss": l2_loss.item(),
+    }
+    _LOG.debug("Training metrics='%s'", metrics)
+    return metrics

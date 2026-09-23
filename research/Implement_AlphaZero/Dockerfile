@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
 RUN mkdir -p /install
 COPY requirements.txt /install/requirements.txt
 RUN pip install --upgrade pip && \
+    pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir jupyterlab jupyterlab_vim jupytext -r /install/requirements.txt
 
 # Config.
