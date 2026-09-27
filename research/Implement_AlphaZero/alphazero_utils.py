@@ -9,6 +9,7 @@ states have an all-zero policy and an exact outcome.
 Search stores values in each node's player-to-move perspective and negates
 them between parent and child in strictly alternating two-player games.
 Supervised minibatches train a CPU MLP on fixed policy and value targets.
+Self-play collects search policies and completed-game outcomes without updates.
 
 Import as:
 
@@ -19,7 +20,7 @@ import dataclasses
 import logging
 import math
 import numbers
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -384,6 +385,20 @@ def _evaluate_search_leaf(
 # #############################################################################
 
 
+def _validate_root_noise(dirichlet_alpha: float, noise_fraction: float) -> None:
+    """
+    Validate the concentration and mixing weight for legal root noise.
+    """
+    hdbg.dassert(
+        np.isfinite(dirichlet_alpha) and dirichlet_alpha > 0,
+        "Dirichlet concentration must be finite and positive",
+    )
+    hdbg.dassert(
+        np.isfinite(noise_fraction) and 0 <= noise_fraction <= 1,
+        "Noise fraction must lie in [0, 1]",
+    )
+
+
 def build_search_tree(
     game: rimtsaazg.Game,
     state: rimtsaazg.State,
@@ -392,6 +407,9 @@ def build_search_tree(
     action_size: int,
     num_simulations: int,
     exploration_constant: float = 1.0,
+    root_noise_fraction: float = 0.0,
+    dirichlet_alpha: float = 0.3,
+    rng: Optional[np.random.Generator] = None,
 ) -> AlphaZeroNode:
     """
     Build a fresh PUCT tree using an explicitly supplied policy/value evaluator.
@@ -401,7 +419,8 @@ def build_search_tree(
     to a leaf, obtains an exact terminal value or an evaluator prediction,
     and updates every node on its path. Thus root visits and the sum of root
     child visits both equal `num_simulations`. Equal scores choose the lowest
-    action index. No random rollouts, root noise, or tree reuse are performed.
+    action index. Optional Dirichlet noise changes root child priors before
+    selection; deeper priors remain untouched. No rollouts or tree reuse occur.
 
     :param game: strictly alternating two-player, zero-sum, deterministic rules
     :param state: reachable nonterminal state in its original representation
@@ -412,6 +431,10 @@ def build_search_tree(
         only the root, allowing inspection of priors
     :param exploration_constant: finite nonnegative exploration weight
         - Default: `1.0`
+    :param root_noise_fraction: root prior mixing weight in `[0, 1]`;
+        zero disables noise and consumes no random numbers
+    :param dirichlet_alpha: finite positive concentration for each legal action
+    :param rng: caller-owned NumPy generator, required when noise is enabled
     :return: root with inspectable priors, states, visits, values, and children
     """
     _LOG.debug(
@@ -424,10 +447,24 @@ def build_search_tree(
     )
     hdbg.dassert_lte(0, num_simulations, "Simulation count cannot be negative")
     hdbg.dassert(not game.is_terminal(state), "Cannot search a terminal root")
+    _validate_root_noise(dirichlet_alpha, root_noise_fraction)
+    if root_noise_fraction > 0:
+        hdbg.dassert_isinstance(
+            rng, np.random.Generator, "Root noise requires an explicit RNG"
+        )
     root = AlphaZeroNode(state, 1.0)
     # Validate exploration before any evaluator call, including with zero budget.
     get_puct_scores(root, exploration_constant)
     _evaluate_search_leaf(root, game, evaluator, action_size)
+    if root_noise_fraction > 0:
+        # Children retain ascending action order; sample only legal entries.
+        noise = rng.dirichlet(np.full(len(root.children), dirichlet_alpha))
+        hdbg.dassert(np.isfinite(noise).all(), "Root noise must be finite")
+        for child, noise_prior in zip(root.children.values(), noise):
+            child.prior = float(
+                (1 - root_noise_fraction) * child.prior
+                + root_noise_fraction * noise_prior
+            )
     for _ in range(num_simulations):
         node = root
         path = [root]
@@ -446,18 +483,28 @@ def build_search_tree(
     return root
 
 
-def get_visit_policy(root: AlphaZeroNode, action_size: int) -> np.ndarray:
+def get_visit_policy(
+    root: AlphaZeroNode, action_size: int, *, temperature: float = 1.0
+) -> np.ndarray:
     """
     Convert root child visit counts into a fixed-size action distribution.
 
-    Visited roots return `N(s, a) / sum_b N(s, b)`. With no simulations, use
-    the root's legal priors instead. Action selection can use `argmax` of the
-    result; NumPy breaks equal probabilities by the lowest action index.
+    Positive temperature returns weights proportional to `N(s, a) ** (1/tau)`.
+    At temperature one this is the normalized visit count; at zero it is a
+    one-hot policy on the lowest-index most-visited action. With no visits,
+    apply the same temperature rule to legal priors instead. Unvisited actions
+    keep zero mass whenever any action has been visited.
 
     :param root: expanded nonterminal root returned by `build_search_tree()`
     :param action_size: fixed positive action count used to build the tree
+    :param temperature: finite nonnegative sampling temperature; default one
+        preserves the usual normalized visit policy
     :return: fresh `float64` policy with zero mass on illegal actions
     """
+    hdbg.dassert(
+        np.isfinite(temperature) and temperature >= 0,
+        "Temperature must be finite and nonnegative",
+    )
     hdbg.dassert_isinstance(action_size, int, "Action count must be an integer")
     hdbg.dassert_lt(0, action_size, "The action space must be nonempty")
     hdbg.dassert(
@@ -474,6 +521,20 @@ def get_visit_policy(root: AlphaZeroNode, action_size: int) -> np.ndarray:
         mask[move] = True
     weights = counts if counts.any() else priors
     policy = normalize_policy(weights, mask)
+    if temperature == 0:
+        best_action = int(np.argmax(policy))
+        policy[:] = 0
+        policy[best_action] = 1.0
+    elif temperature != 1:
+        # Shift logs before division: small tau can underflow losing actions,
+        # but the largest entry always stays exp(0), so mass never disappears.
+        positive = policy > 0
+        log_weights = np.log(policy[positive])
+        with np.errstate(over="ignore", under="ignore"):
+            policy[positive] = np.exp(
+                (log_weights - log_weights.max()) / temperature
+            )
+        policy /= policy.sum()
     return policy
 
 
@@ -710,3 +771,178 @@ def train_batch(
     }
     _LOG.debug("Training metrics='%s'", metrics)
     return metrics
+
+
+# #############################################################################
+# Self-play records and configuration
+# #############################################################################
+
+
+@dataclasses.dataclass
+class TrainingExample:
+    """
+    Own one original state, its search policy, and its completed-game outcome.
+
+    Policy entries retain fixed action coordinates. `value` is the winner
+    times this state's player to move, hence exactly -1, 0, or +1. The state
+    precedes its selected move and is nonterminal; callers supply reachable
+    states and legal policies. Encode states only when assembling a minibatch.
+    """
+
+    state: rimtsaazg.State
+    policy: np.ndarray
+    value: float
+
+    def __post_init__(self) -> None:
+        """
+        Copy the state and policy and validate the numerical training target.
+        """
+        prediction = PolicyValuePrediction(self.policy, self.value)
+        hdbg.dassert_lt(0, prediction.policy.sum(), "Targets need policy mass")
+        hdbg.dassert_in(
+            prediction.value, (-1.0, 0.0, 1.0), "Use a completed-game outcome"
+        )
+        self.state = tuple(self.state)
+        self.policy = prediction.policy
+        self.value = prediction.value
+
+
+@dataclasses.dataclass(frozen=True)
+class SelfPlayConfig:
+    """
+    Hold explicit search, exploration, and termination settings for one game.
+
+    `temperature` applies to the first `temperature_moves` plies (moves by
+    either player); subsequent policies use temperature zero. Dirichlet noise
+    applies to each new root throughout the game, independently of temperature.
+    `max_moves` is a guard: an unfinished game at the limit raises instead of
+    producing fabricated draw labels. No truncated examples are returned.
+    """
+
+    num_simulations: int
+    temperature: float
+    temperature_moves: int
+    dirichlet_alpha: float
+    root_noise_fraction: float
+    max_moves: int
+    exploration_constant: float = 1.0
+
+    def __post_init__(self) -> None:
+        """
+        Reject invalid configurations before any search or RNG consumption.
+        """
+        for name in ("num_simulations", "temperature_moves", "max_moves"):
+            value = getattr(self, name)
+            hdbg.dassert_isinstance(
+                value, int, "Move/budget counts must be integers"
+            )
+        hdbg.dassert_lt(
+            0, self.num_simulations, "Self-play needs a positive search budget"
+        )
+        hdbg.dassert_lte(
+            0, self.temperature_moves, "Temperature duration cannot be negative"
+        )
+        hdbg.dassert_lt(0, self.max_moves, "Move limit must be positive")
+        hdbg.dassert(
+            np.isfinite(self.temperature) and self.temperature >= 0,
+            "Temperature must be finite and nonnegative",
+        )
+        hdbg.dassert(
+            np.isfinite(self.exploration_constant)
+            and self.exploration_constant >= 0,
+            "Exploration must be finite and nonnegative",
+        )
+        _validate_root_noise(self.dirichlet_alpha, self.root_noise_fraction)
+
+
+@dataclasses.dataclass
+class SelfPlayResult:
+    """
+    Return aligned examples and moves plus the final original state and winner.
+
+    `examples[i].state` is the position before `moves[i]`. The terminal state
+    is recorded separately and never used as a policy training example.
+    """
+
+    examples: List[TrainingExample]
+    moves: List[rimtsaazg.Move]
+    final_state: rimtsaazg.State
+    winner: int
+
+
+# #############################################################################
+# Self-play collection
+# #############################################################################
+
+
+def play_self_play_game(
+    game: rimtsaazg.Game,
+    evaluator: PolicyValueEvaluator,
+    config: SelfPlayConfig,
+    rng: np.random.Generator,
+    *,
+    action_size: int,
+) -> SelfPlayResult:
+    """
+    Collect a complete game using one fixed evaluator for both players.
+
+    Start from the game's initial state and build a fresh PUCT tree each ply.
+    Store the temperature-adjusted visit policy used to sample that move.
+    Only after terminality assign outcomes from each stored state's player
+    perspective. The collector does not train, alter evaluator parameters,
+    use global random state, or retain trees across moves. Caller evaluators
+    should be deterministic and side-effect free for seeded reproducibility.
+
+    :param game: terminating, strictly alternating two-player zero-sum rules
+    :param evaluator: fixed callable supplying priors and player-to-move values
+    :param config: validated search, sampling, and maximum game length settings
+    :param rng: caller-owned generator shared by root noise and move sampling
+    :param action_size: fixed positive action count, independent of board size
+    :return: aligned states, policies, final labels, played moves, and outcome;
+        an initially terminal game returns no examples or moves
+    """
+    hdbg.dassert_isinstance(rng, np.random.Generator, "Supply an explicit RNG")
+    hdbg.dassert_isinstance(action_size, int, "Action count must be an integer")
+    hdbg.dassert_lt(0, action_size, "Action space must be nonempty")
+    state = game.get_initial_state()
+    pending = []
+    moves = []
+    while not game.is_terminal(state):
+        hdbg.dassert_lt(
+            len(moves),
+            config.max_moves,
+            "Game exceeded max_moves before reaching a terminal outcome",
+        )
+        root = build_search_tree(
+            game,
+            state,
+            evaluator,
+            action_size=action_size,
+            num_simulations=config.num_simulations,
+            exploration_constant=config.exploration_constant,
+            root_noise_fraction=config.root_noise_fraction,
+            dirichlet_alpha=config.dirichlet_alpha,
+            rng=rng,
+        )
+        temperature = (
+            config.temperature if len(moves) < config.temperature_moves else 0.0
+        )
+        policy = get_visit_policy(root, action_size, temperature=temperature)
+        # Greedy moves consume no random numbers; positive tau samples pi.
+        move = (
+            int(rng.choice(action_size, p=policy))
+            if temperature > 0
+            else int(np.argmax(policy))
+        )
+        pending.append((state, policy, game.get_current_player(state)))
+        moves.append(move)
+        state = game.apply_move(state, move)
+    winner = game.get_winner(state)
+    hdbg.dassert_in(winner, (-1, 0, 1), "Winner must identify a player or draw")
+    examples = [
+        TrainingExample(board, policy, float(winner * player))
+        for board, policy, player in pending
+    ]
+    result = SelfPlayResult(examples, moves, state, winner)
+    _LOG.debug("Collected moves='%s', winner='%s'", len(moves), winner)
+    return result

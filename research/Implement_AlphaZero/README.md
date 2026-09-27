@@ -1,8 +1,9 @@
 # Implement AlphaZero
 
-Game representations, a trainable policy/value network, and PUCT search for AlphaZero.
+Game representations, a trainable policy/value network, PUCT search, and self-play
+data collection for AlphaZero.
 The API notebook explains board encodings, legal priors, terminal outcomes,
-search statistics, action selection, and supervised learning with small
+search statistics, action selection, supervised learning, and self-play with small
 Tic-Tac-Toe examples.
 
 The project reuses the `Game` interface and board games from the
@@ -11,7 +12,7 @@ Game rules remain separate from representation and evaluation. All AlphaZero
 implementation lives in `alphazero_utils.py`. The single `alphazero.API.ipynb`
 tutorial progresses from board conventions and the uniform evaluator to
 hand-traced search, a complete game played by search, and fitting a network
-to four controlled examples.
+to four controlled examples, followed by collecting a complete self-play game.
 
 ## Structure of the Directory
 
@@ -23,9 +24,9 @@ to four controlled examples.
 
 | File | Description |
 | :--- | :--- |
-| `alphazero_utils.py` | Board representations, evaluators, PUCT, CPU policy/value network, and minibatch learning |
-| `alphazero.API.ipynb` | Guided API tour with search traces, a complete game, and controlled network fitting |
-| `test/test_alphazero_utils.py` | Representation, evaluation, search, network, and learning tests |
+| `alphazero_utils.py` | Board representations, evaluators, PUCT, CPU policy/value network, minibatch learning, and self-play |
+| `alphazero.API.ipynb` | Guided API tour with search traces, a complete game, controlled network fitting, and self-play targets |
+| `test/test_alphazero_utils.py` | Representation, evaluation, search, network, learning, and self-play tests |
 | `test/test_docker_template.py` | Docker build/script checks and notebook execution using shared helpers |
 | `requirements.txt` | Project dependencies, PyTorch 2.6.0, and `pytest<9` for shared test hooks |
 | `Dockerfile` | Python 3.12 slim CPU image with Jupyter and project dependencies |
@@ -122,13 +123,15 @@ before the counted simulations. Its initial value estimate is not backed up.
 Each simulation descends to a leaf, expands it if unfinished, and backs up a
 value with alternating signs. Exact terminal outcomes bypass the evaluator.
 Nonterminal priors are masked and normalized before expansion. Search performs
-no random rollouts, training, or root-noise sampling.
+no random rollouts or training. Root noise is disabled by default; enable it
+explicitly for exploration during self-play.
 
 Root visits and the sum of root child visits both equal `num_simulations`.
 A nonroot node's first visit evaluates that node without selecting one of
 its children; its own count therefore need not equal its children's counts.
-With zero simulations, `get_visit_policy()` returns the root priors. With
-positive simulations, it returns normalized child counts, which can be used
+At its default temperature of one, `get_visit_policy()` returns root priors
+with zero simulations or normalized child counts with positive simulations.
+These probabilities can be used
 with `np.argmax()` to choose the most-visited action. Terminal roots are
 rejected; check `game.is_terminal()` before requesting another move.
 
@@ -146,8 +149,9 @@ move = int(np.argmax(policy))
 
 The uniform evaluator supplies neutral estimates at unfinished leaves. Search
 can discover tactical outcomes by reaching terminal positions, but a finite
-budget does not guarantee optimal play. Repeating a search with the same
-deterministic evaluator and configuration produces the same result. Each
+budget does not guarantee optimal play. With noise disabled, repeating a search with the same
+deterministic evaluator and configuration produces the same result. With noise
+enabled, reproduce it by starting from the same explicit RNG state. Each
 call builds a new tree; it does not retain statistics across moves.
 
 ## Policy/Value Network and Supervised Learning
@@ -207,6 +211,72 @@ The notebook fits four hand-built positions covering wins for either player,
 a draw, and a forced loss. It shows before/after probabilities, value estimates,
 loss curves, and integration with PUCT. Fitting these examples demonstrates
 learning mechanics; it does not establish generalization or playing strength.
+
+## Self-Play Data Collection
+
+`play_self_play_game()` plays both seats with a fixed evaluator and collects
+training records after a complete game. It builds a fresh tree each move and
+never applies optimizer updates. It supports the same strictly alternating,
+two-player, zero-sum game interface as PUCT.
+
+| API | Behavior |
+| :--- | :--- |
+| `TrainingExample(state, policy, value)` | Owns the original pre-move state, a copied policy, and a final outcome label |
+| `SelfPlayConfig(...)` | Validates budgets, temperature schedule, root noise, and maximum game length |
+| `SelfPlayResult` | Contains aligned `examples` and `moves`, plus `final_state` and `winner` |
+| `play_self_play_game(game, evaluator, config, rng, action_size=...)` | Starts at the game's initial state and returns a completed result |
+
+At every root, optional noise mixes each legal prior as
+`(1 - root_noise_fraction) * prior + root_noise_fraction * noise`.
+The Dirichlet sample has one entry per legal action, drawn in ascending action
+order with concentration `dirichlet_alpha`. Mixing happens after root expansion
+and before the first simulation; deeper priors are untouched. Noise remains
+active at every new root, including after the temperature schedule ends.
+Ordinary `build_search_tree()` calls retain noise fraction zero. Enabled noise
+requires an explicit `np.random.Generator`; disabled noise consumes no draws.
+
+`get_visit_policy(..., temperature=tau)` uses visit weights proportional to
+`count ** (1 / tau)` for positive temperature. Log-space scaling avoids overflow
+for very small temperatures. Temperature zero yields a one-hot policy on the
+most-visited action, with lowest-index ties. Unvisited actions retain zero mass
+when any visits exist. Standalone zero-budget search uses the same temperature
+rule on priors; self-play requires a positive simulation budget.
+
+The first `temperature_moves` plies use the configured temperature; subsequent
+plies use zero. A ply is one move by either player. The saved policy is the
+**temperature-adjusted policy used to choose the move**, including one-hot
+policies for greedy moves. Positive temperature samples with the supplied RNG;
+zero temperature uses argmax without consuming a sampling draw. The collector
+shares that generator between root noise and move sampling and never seeds a
+global random stream. Resetting the seed reproduces a game with a deterministic
+evaluator and the same settings; reusing a generator advances its stream.
+
+After terminality, each record receives `winner * player_to_move(record.state)`.
+Decisive outcomes therefore alternate signs across plies; draws label every
+record zero. The terminal board is stored separately, not as an all-zero policy
+example. An initially terminal game returns empty examples and moves.
+If a game is unfinished at `max_moves`, collection raises and returns no
+partially labeled data. The evaluator must remain fixed and side-effect free
+throughout collection; the supplied network evaluator preserves parameters,
+mode, and existing gradients.
+
+```python
+config = rialzut.SelfPlayConfig(
+    num_simulations=16, temperature=1.0, temperature_moves=3,
+    dirichlet_alpha=0.3, root_noise_fraction=0.25, max_moves=9,
+)
+result = rialzut.play_self_play_game(
+    game, network_evaluator, config, np.random.default_rng(7), action_size=9
+)
+# Align each pre-move board with its policy and final player-relative outcome.
+inputs = np.stack([rialzut.encode_state(game, e.state) for e in result.examples])
+policies = np.stack([e.policy for e in result.examples])
+values = np.array([e.value for e in result.examples], dtype=np.float32)
+```
+
+The notebook traces one seeded game's moves, legal policies, and labels,
+checks reproducibility, and assembles batch arrays without updating the model.
+Collected games establish data alignment, not playing strength.
 
 ## Run Locally
 
@@ -298,10 +368,10 @@ for additional script options.
 
 | Check | Result |
 | :--- | :--- |
-| Core tests in the local development environment | 74 passed: 15 representation, 22 baseline evaluator, 23 search, and 14 network/learning tests |
-| Core tests in the rebuilt CPU image | 74 passed with PyTorch 2.6.0+cpu |
+| Core tests in the local development environment | 93 passed: 74 existing tests and 19 self-play/noise/temperature tests |
+| Core tests in the CPU image | 93 passed with PyTorch 2.6.0+cpu |
 | Notebook execution in fresh local and Docker kernels | Passed |
-| Docker integration checks | CPU image build, command, and notebook execution passed; shared shell checks passed previously |
+| Docker integration checks | Command and notebook execution passed; image build and shared shell checks passed previously |
 | Notebook schema | Valid |
 | Python formatting, shell syntax, and symlink targets | Passed |
 
@@ -314,8 +384,11 @@ determinism, action masking, and immediate wins and forced blocks for both
 players. Network tests check shapes, RNG isolation, masking before softmax,
 terminal bypass, PUCT integration, hand-computed losses and gradients, L2,
 gradient clearing, input validation, and fitting four controlled examples.
-The notebook executes a complete game with uniform-prior search and shows
-the supervised network's loss curves and before/after predictions.
+Self-play tests cover hand-computed temperatures, legal root-only noise,
+seeded sampling, policy/trajectory alignment, wins for both players, draws,
+move-limit handling, Connect Four column actions, and unchanged network state.
+The notebook executes a complete game with uniform-prior search, shows the
+supervised network's loss curves, and traces a seeded self-play game's targets.
 
 The shared helpers emit deprecation warnings for `datetime.utcnow()` and the
 root pytest hook's legacy `path` argument. The latter is why this project's
