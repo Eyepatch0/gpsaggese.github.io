@@ -10,22 +10,27 @@ Search stores values in each node's player-to-move perspective and negates
 them between parent and child in strictly alternating two-player games.
 Supervised minibatches train a CPU MLP on fixed policy and value targets.
 Self-play collects search policies and completed-game outcomes without updates.
+The training loop alternates collection and replay updates on one CPU model.
 
 Import as:
 
 import research.Implement_AlphaZero.alphazero_utils as rialzut
 """
 
+import collections
 import dataclasses
 import logging
 import math
 import numbers
-from typing import Callable, Dict, List, Optional, Tuple
+import os
+import tempfile
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import trange
 
 import helpers.hdbg as hdbg
 import research.Implement_MonteCarlo_Tree_Search_and_Alpha_Zero.game as rimtsaazg
@@ -946,3 +951,376 @@ def play_self_play_game(
     result = SelfPlayResult(examples, moves, state, winner)
     _LOG.debug("Collected moves='%s', winner='%s'", len(moves), winner)
     return result
+
+
+# #############################################################################
+# ReplayBuffer
+# #############################################################################
+
+
+class ReplayBuffer:
+    """
+    Keep the most recent completed-game examples in bounded FIFO storage.
+
+    Insertions and reads copy records so caller mutations cannot alter replay.
+    Sampling is uniform with replacement: a full minibatch is available even
+    when the buffer holds fewer records than the requested batch size. Records
+    must come from the same game and use matching board and action dimensions.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        """
+        Allocate empty replay storage with a fixed positive record limit.
+
+        :param capacity: maximum number of positions, not number of games
+        """
+        hdbg.dassert_isinstance(capacity, int, "Capacity must be an integer")
+        hdbg.dassert_lt(0, capacity, "Replay capacity must be positive")
+        self._examples: Deque[TrainingExample] = collections.deque(
+            maxlen=capacity
+        )
+
+    @property
+    def capacity(self) -> int:
+        """
+        Return the configured maximum record count.
+        """
+        return self._examples.maxlen
+
+    def __len__(self) -> int:
+        """
+        Return the current number of retained positions.
+        """
+        return len(self._examples)
+
+    def add(self, example: TrainingExample) -> None:
+        """
+        Copy a record into replay, evicting the oldest if storage is full.
+
+        :param example: completed-game target from the same game as prior data
+        """
+        owned = TrainingExample(example.state, example.policy, example.value)
+        if self._examples:
+            oldest = self._examples[0]
+            hdbg.dassert_eq(
+                len(owned.state),
+                len(oldest.state),
+                "Replay board sizes must match",
+            )
+            hdbg.dassert_eq(
+                owned.policy.shape,
+                oldest.policy.shape,
+                "Replay action sizes must match",
+            )
+        self._examples.append(owned)
+
+    def get_examples(self) -> List[TrainingExample]:
+        """
+        Return independent records in oldest-to-newest order for inspection.
+        """
+        return [
+            TrainingExample(e.state, e.policy, e.value) for e in self._examples
+        ]
+
+    def sample(
+        self, batch_size: int, rng: np.random.Generator
+    ) -> List[TrainingExample]:
+        """
+        Draw independent record copies uniformly with replacement.
+
+        :param batch_size: positive number of examples to return
+        :param rng: explicit caller-owned generator, advanced by sampling
+        :return: copied examples in sampled order; duplicates are allowed
+        """
+        hdbg.dassert_isinstance(
+            batch_size, int, "Batch size must be an integer"
+        )
+        hdbg.dassert_lt(0, batch_size, "Batch size must be positive")
+        hdbg.dassert_lt(0, len(self), "Cannot sample empty replay")
+        hdbg.dassert_isinstance(
+            rng, np.random.Generator, "Supply an explicit RNG"
+        )
+        examples = list(self._examples)
+        indices = rng.choice(len(examples), size=batch_size, replace=True)
+        return [
+            TrainingExample(
+                examples[i].state, examples[i].policy, examples[i].value
+            )
+            for i in indices
+        ]
+
+
+# #############################################################################
+# Training configuration and metrics
+# #############################################################################
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainingConfig:
+    """
+    Set explicit CPU training budgets and the self-play configuration.
+
+    Each iteration collects `games_per_iteration` complete games with fixed
+    parameters, adds their positions to replay, then takes
+    `updates_per_iteration` minibatch steps. L2 is supplied to `train_batch()`;
+    the optimizer must use zero weight decay to avoid double regularization.
+    """
+
+    iterations: int
+    games_per_iteration: int
+    updates_per_iteration: int
+    batch_size: int
+    l2_coefficient: float
+    self_play: SelfPlayConfig
+
+    def __post_init__(self) -> None:
+        """
+        Reject invalid budgets and loss settings before training begins.
+        """
+        for name in (
+            "iterations",
+            "games_per_iteration",
+            "updates_per_iteration",
+            "batch_size",
+        ):
+            value = getattr(self, name)
+            hdbg.dassert_isinstance(
+                value, int, "Training counts must be integers"
+            )
+            hdbg.dassert_lt(0, value, "Training counts must be positive")
+        hdbg.dassert(
+            np.isfinite(self.l2_coefficient) and self.l2_coefficient >= 0,
+            "L2 coefficient must be finite and nonnegative",
+        )
+        hdbg.dassert_isinstance(
+            self.self_play, SelfPlayConfig, "Supply self-play settings"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainingMetrics:
+    """
+    Summarize one completed collection/update iteration.
+
+    Loss fields are means of pre-update minibatch losses within the iteration,
+    not a fixed validation-set loss or a measure of playing strength.
+    `generated_examples` counts positions before any replay eviction.
+    Iteration numbering starts at one for each call to `train_alphazero()`.
+    """
+
+    iteration: int
+    games: int
+    generated_examples: int
+    replay_size: int
+    updates: int
+    loss: float
+    policy_loss: float
+    value_loss: float
+    l2_loss: float
+
+
+# #############################################################################
+# Training loop
+# #############################################################################
+
+
+def train_alphazero(
+    game: rimtsaazg.Game,
+    network: PolicyValueNetwork,
+    optimizer: torch.optim.Optimizer,
+    replay: ReplayBuffer,
+    config: TrainingConfig,
+    rng: np.random.Generator,
+    *,
+    show_progress: bool = True,
+) -> List[TrainingMetrics]:
+    """
+    Alternate complete self-play games and replay updates on one CPU network.
+
+    The supplied model, optimizer, replay, and RNG are updated in place. Reuse
+    all four across calls to continue an in-memory run, preserving optimizer
+    moments, old examples, and the random stream. Replay sampling uses the
+    same generator as self-play; model initialization has its own explicit seed.
+    There is no arena selection or separate opponent network.
+
+    :param game: the same terminating two-player game for all replay records
+    :param network: CPU float32 policy/value model matching the game dimensions
+    :param optimizer: optimizer owning exactly this network's parameters,
+        with weight decay zero; its state persists across all minibatches
+    :param replay: bounded storage, optionally containing earlier game examples
+    :param config: explicit collection and update budgets
+    :param rng: explicit generator for root noise, actions, and replay sampling
+    :param show_progress: display iteration progress; disable in automated tests
+    :return: one metric record per completed iteration; training errors propagate
+        and previously completed games or optimizer steps are not rolled back
+    """
+    hdbg.dassert_isinstance(rng, np.random.Generator, "Supply an explicit RNG")
+    initial_state = game.get_initial_state()
+    hdbg.dassert(
+        not game.is_terminal(initial_state),
+        "Training needs a nonterminal initial state",
+    )
+    hdbg.dassert_eq(
+        len(initial_state), network.input_size, "Network must match board size"
+    )
+    parameters = list(network.parameters())
+    optimizer_parameters = [
+        p for group in optimizer.param_groups for p in group["params"]
+    ]
+    hdbg.dassert_eq(
+        len(optimizer_parameters),
+        len(parameters),
+        "Optimizer must own all model parameters exactly once",
+    )
+    hdbg.dassert_eq(
+        {id(p) for p in optimizer_parameters},
+        {id(p) for p in parameters},
+        "Optimizer belongs to a different model",
+    )
+    for group in optimizer.param_groups:
+        hdbg.dassert_eq(
+            group.get("weight_decay", 0),
+            0,
+            "Use explicit L2, not optimizer weight decay",
+        )
+    if len(replay):
+        example = replay.get_examples()[0]
+        hdbg.dassert_eq(
+            len(example.state),
+            network.input_size,
+            "Replay board size must match model",
+        )
+        hdbg.dassert_eq(
+            example.policy.shape,
+            (network.action_size,),
+            "Replay action size must match model",
+        )
+    evaluator = NetworkEvaluator(network)
+    history = []
+    for iteration in trange(
+        config.iterations, desc="AlphaZero training", disable=not show_progress
+    ):
+        generated_examples = 0
+        # Keep weights fixed throughout collection, then update from replay.
+        for _ in range(config.games_per_iteration):
+            result = play_self_play_game(
+                game,
+                evaluator,
+                config.self_play,
+                rng,
+                action_size=network.action_size,
+            )
+            for example in result.examples:
+                replay.add(example)
+            generated_examples += len(result.examples)
+        losses = []
+        for _ in range(config.updates_per_iteration):
+            batch = replay.sample(config.batch_size, rng)
+            inputs = np.stack([encode_state(game, e.state) for e in batch])
+            policies = np.stack([e.policy for e in batch])
+            values = np.array([e.value for e in batch], dtype=np.float32)
+            metrics = train_batch(
+                network,
+                optimizer,
+                inputs,
+                policies,
+                values,
+                l2_coefficient=config.l2_coefficient,
+            )
+            losses.append(metrics)
+        mean_losses = {
+            name: float(np.mean([m[name] for m in losses]))
+            for name in losses[0]
+        }
+        summary = TrainingMetrics(
+            iteration=iteration + 1,
+            games=config.games_per_iteration,
+            generated_examples=generated_examples,
+            replay_size=len(replay),
+            updates=config.updates_per_iteration,
+            **mean_losses,
+        )
+        history.append(summary)
+        _LOG.debug("Training iteration='%s'", summary)
+    return history
+
+
+# #############################################################################
+# Network checkpoints
+# #############################################################################
+
+
+def save_checkpoint(network: PolicyValueNetwork, path: str) -> None:
+    """
+    Atomically save network dimensions and CPU weights for later inference.
+
+    The versioned payload contains tensors and primitive metadata only. This
+    is a model checkpoint: optimizer state, replay data, RNG state, gradients,
+    and training progress are not stored. Save between optimizer steps.
+
+    :param network: finite CPU float32 policy/value network to snapshot
+    :param path: destination file in an existing directory; replace it only
+        after serialization succeeds
+    """
+    state_dict = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in network.state_dict().items()
+    }
+    hdbg.dassert(
+        all(torch.isfinite(t).all().item() for t in state_dict.values()),
+        "Checkpoint parameters must be finite",
+    )
+    payload = {
+        "format_version": 1,
+        "architecture": {
+            "input_size": network.input_size,
+            "action_size": network.action_size,
+            "hidden_size": network.hidden_size,
+        },
+        "state_dict": state_dict,
+    }
+    directory = os.path.dirname(os.path.abspath(path))
+    # A sibling temporary file makes replacement atomic on the same filesystem.
+    temporary_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=directory, prefix=".alphazero-", suffix=".pt", delete=False
+        ) as stream:
+            temporary_path = stream.name
+            torch.save(payload, stream)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def load_checkpoint(path: str) -> PolicyValueNetwork:
+    """
+    Recreate a CPU model from a versioned network checkpoint.
+
+    Load tensors with `weights_only=True` and CPU mapping, then require an
+    exact state-dictionary match. The returned independent model is in eval
+    mode with no gradients. Optimizer/replay/RNG state is not restored, so this
+    is not an exact training-resume API.
+
+    :param path: file created by `save_checkpoint()`
+    :return: CPU float32 network with the saved dimensions and parameters
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    hdbg.dassert_eq(
+        payload["format_version"], 1, "Unsupported checkpoint version"
+    )
+    architecture = payload["architecture"]
+    network = PolicyValueNetwork(
+        architecture["input_size"],
+        architecture["action_size"],
+        hidden_size=architecture["hidden_size"],
+        seed=0,
+    )
+    network.load_state_dict(payload["state_dict"], strict=True)
+    hdbg.dassert(
+        all(torch.isfinite(p).all().item() for p in network.parameters()),
+        "Checkpoint parameters must be finite",
+    )
+    network.eval()
+    return network

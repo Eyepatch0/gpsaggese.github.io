@@ -1,10 +1,10 @@
 # Implement AlphaZero
 
-Game representations, a trainable policy/value network, PUCT search, and self-play
-data collection for AlphaZero.
+Game representations, a CPU policy/value network, PUCT search, self-play,
+and replay-based training for AlphaZero.
 The API notebook explains board encodings, legal priors, terminal outcomes,
-search statistics, action selection, supervised learning, and self-play with small
-Tic-Tac-Toe examples.
+search statistics, action selection, self-play, replay updates, and network
+checkpoints with small Tic-Tac-Toe examples.
 
 The project reuses the `Game` interface and board games from the
 [MCTS project](../Implement_MonteCarlo_Tree_Search_and_Alpha_Zero/README.md).
@@ -12,7 +12,8 @@ Game rules remain separate from representation and evaluation. All AlphaZero
 implementation lives in `alphazero_utils.py`. The single `alphazero.API.ipynb`
 tutorial progresses from board conventions and the uniform evaluator to
 hand-traced search, a complete game played by search, and fitting a network
-to four controlled examples, followed by collecting a complete self-play game.
+to four controlled examples, collecting self-play games, training from replay,
+and reloading a saved network.
 
 ## Structure of the Directory
 
@@ -24,9 +25,9 @@ to four controlled examples, followed by collecting a complete self-play game.
 
 | File | Description |
 | :--- | :--- |
-| `alphazero_utils.py` | Board representations, evaluators, PUCT, CPU policy/value network, minibatch learning, and self-play |
-| `alphazero.API.ipynb` | Guided API tour with search traces, a complete game, controlled network fitting, and self-play targets |
-| `test/test_alphazero_utils.py` | Representation, evaluation, search, network, learning, and self-play tests |
+| `alphazero_utils.py` | Board representations, evaluators, PUCT, CPU policy/value network, minibatch learning, self-play, replay training, and checkpoints |
+| `alphazero.API.ipynb` | Guided API tour with search traces, a complete game, controlled fitting, self-play targets, replay training, and checkpoint reloads |
+| `test/test_alphazero_utils.py` | Representation, evaluation, search, network, learning, self-play, replay, training-loop, and checkpoint tests |
 | `test/test_docker_template.py` | Docker build/script checks and notebook execution using shared helpers |
 | `requirements.txt` | Project dependencies, PyTorch 2.6.0, and `pytest<9` for shared test hooks |
 | `Dockerfile` | Python 3.12 slim CPU image with Jupyter and project dependencies |
@@ -278,6 +279,92 @@ The notebook traces one seeded game's moves, legal policies, and labels,
 checks reproducibility, and assembles batch arrays without updating the model.
 Collected games establish data alignment, not playing strength.
 
+## Training From Replay
+
+`ReplayBuffer(capacity)` keeps the newest positions in FIFO order. Capacity
+counts positions rather than games, so old games can be partially evicted.
+`add()` copies each record and checks consistent board/action dimensions.
+`get_examples()` returns independent copies in oldest-to-newest order.
+`sample(batch_size, rng)` samples uniformly **with replacement** and returns
+independent copies, including when the same position is selected twice. This
+allows full minibatches while a new buffer contains only a few examples.
+Sampling an empty buffer is rejected.
+
+| API | Behavior |
+| :--- | :--- |
+| `TrainingConfig(...)` | Positive iteration/game/update/batch budgets, L2 coefficient, and `SelfPlayConfig` |
+| `TrainingMetrics` | Iteration, games, generated positions, retained replay size, updates, and mean loss components |
+| `train_alphazero(game, network, optimizer, replay, config, rng)` | Collect complete games, add their targets to replay, then update from sampled minibatches |
+
+All games within an iteration use fixed network parameters. Updates happen
+only after collection, and the next iteration's games use the updated model.
+The network, optimizer, replay, and NumPy generator are supplied by the caller
+and updated in place. Reuse all four to continue an in-memory run without
+resetting Adam moments, retained examples, or the sampling stream. The generator
+is shared by root noise, action sampling, and replay sampling. Model
+initialization has its own explicit seed. Existing replay must contain targets
+from the same game and match the model's board and action dimensions.
+
+The optimizer must own exactly the model's parameters and use zero weight decay;
+L2 is included explicitly in `train_batch()`. Metrics contain one record per
+iteration, numbered from one for each function call. `generated_examples`
+counts positions before FIFO eviction. Loss fields average **pre-update**
+minibatch losses within that iteration. Training data changes between updates,
+so these losses need not decrease monotonically or measure playing strength.
+Errors propagate; already completed games and updates are retained in memory.
+
+```python
+network = rialzut.PolicyValueNetwork(9, 9, hidden_size=32, seed=21)
+optimizer = torch.optim.Adam(network.parameters(), lr=0.01, weight_decay=0.0)
+replay = rialzut.ReplayBuffer(32)
+rng = np.random.default_rng(21)
+training_config = rialzut.TrainingConfig(
+    iterations=4, games_per_iteration=2, updates_per_iteration=6,
+    batch_size=16, l2_coefficient=1e-4,
+    self_play=rialzut.SelfPlayConfig(
+        num_simulations=16, temperature=1.0, temperature_moves=3,
+        dirichlet_alpha=0.3, root_noise_fraction=0.25, max_moves=9,
+    ),
+)
+history = rialzut.train_alphazero(
+    game, network, optimizer, replay, training_config, rng
+)
+```
+
+The notebook runs this budget on CPU: eight games and 24 optimizer steps,
+with at most 32 retained positions. It displays replay contents, iteration
+metrics, and loss curves. This is an integration demonstration, not evidence
+of competitive play. Pass `show_progress=False` to suppress the progress bar.
+
+## Network Checkpoints
+
+`save_checkpoint(network, path)` saves architecture dimensions and parameter
+tensors in a versioned payload. It serializes to a sibling temporary file and
+atomically replaces the destination after success, preserving the previous
+file if serialization fails. The destination directory must already exist.
+
+`load_checkpoint(path)` uses CPU mapping and `weights_only=True`, checks the
+format version, requires matching parameter names/shapes, and rejects nonfinite
+weights. It reconstructs an independent CPU float32 model in evaluation mode,
+without gradients and without advancing the caller's CPU random stream.
+
+```python
+import os
+import tempfile
+
+checkpoint_dir = tempfile.mkdtemp(prefix="alphazero-model-")
+checkpoint_path = os.path.join(checkpoint_dir, "alphazero.policy_value.pt")
+rialzut.save_checkpoint(network, checkpoint_path)
+restored_network = rialzut.load_checkpoint(checkpoint_path)
+restored_evaluator = rialzut.NetworkEvaluator(restored_network)
+```
+
+These are **model checkpoints** for inference or fresh optimization. They do
+not contain optimizer moments, replay, RNG state, gradients, or training
+progress, so loading does not exactly resume a training run. The notebook
+checks identical predictions and deterministic PUCT policies after reloading.
+Its checkpoint lives outside the source tree in the displayed temporary path.
+
 ## Run Locally
 
 Use a checkout with the `helpers_root` submodule present. Run these commands
@@ -368,8 +455,8 @@ for additional script options.
 
 | Check | Result |
 | :--- | :--- |
-| Core tests in the local development environment | 93 passed: 74 existing tests and 19 self-play/noise/temperature tests |
-| Core tests in the CPU image | 93 passed with PyTorch 2.6.0+cpu |
+| Core tests in the local development environment | 106 passed: 93 existing tests and 13 replay/training/checkpoint tests |
+| Core tests in the CPU image | 106 passed with PyTorch 2.6.0+cpu |
 | Notebook execution in fresh local and Docker kernels | Passed |
 | Docker integration checks | Command and notebook execution passed; image build and shared shell checks passed previously |
 | Notebook schema | Valid |
@@ -387,8 +474,13 @@ gradient clearing, input validation, and fitting four controlled examples.
 Self-play tests cover hand-computed temperatures, legal root-only noise,
 seeded sampling, policy/trajectory alignment, wins for both players, draws,
 move-limit handling, Connect Four column actions, and unchanged network state.
-The notebook executes a complete game with uniform-prior search, shows the
-supervised network's loss curves, and traces a seeded self-play game's targets.
+Training-loop tests cover FIFO bounds, record ownership, replacement sampling,
+collection/update ordering, finite metrics, parameter changes, optimizer
+continuation, and repeatable seeded runs. Checkpoint tests verify prediction
+and search round trips, independent CPU models, atomic replacement, and
+rejection of incompatible or nonfinite weights.
+The notebook executes uniform-prior search, supervised fitting, self-play,
+a small replay training run, and checkpoint reload with matching predictions.
 
 The shared helpers emit deprecation warnings for `datetime.utcnow()` and the
 root pytest hook's legacy `path` argument. The latter is why this project's
