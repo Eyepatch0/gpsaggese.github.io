@@ -1,7 +1,7 @@
 # Implement AlphaZero
 
 Game representations, a CPU policy/value network, PUCT search, self-play,
-and replay-based training for AlphaZero.
+replay-based training, and paired-seat evaluation for AlphaZero.
 The API notebook explains board encodings, legal priors, terminal outcomes,
 search statistics, action selection, self-play, replay updates, and network
 checkpoints with small Tic-Tac-Toe examples.
@@ -13,7 +13,9 @@ implementation lives in `alphazero_utils.py`. The single `alphazero.API.ipynb`
 tutorial progresses from board conventions and the uniform evaluator to
 hand-traced search, a complete game played by search, and fitting a network
 to four controlled examples, collecting self-play games, training from replay,
-and reloading a saved network.
+reloading a saved network, and comparing fixed agents in both seats.
+The companion [tutorial article](alphazero.tutorial.md) explains the complete
+implementation and records the measured comparison and its limitations.
 
 ## Structure of the Directory
 
@@ -25,8 +27,9 @@ and reloading a saved network.
 
 | File | Description |
 | :--- | :--- |
-| `alphazero_utils.py` | Board representations, evaluators, PUCT, CPU policy/value network, minibatch learning, self-play, replay training, and checkpoints |
-| `alphazero.API.ipynb` | Guided API tour with search traces, a complete game, controlled fitting, self-play targets, replay training, and checkpoint reloads |
+| `alphazero_utils.py` | Board representations, evaluators, PUCT, CPU policy/value network, minibatch learning, self-play, replay training, checkpoints, and paired-seat evaluation |
+| `alphazero.API.ipynb` | Guided API tour with search traces, a complete game, controlled fitting, self-play targets, replay training, checkpoint reloads, and baseline comparisons |
+| `alphazero.tutorial.md` | End-to-end explanation, reproducible evaluation setup, measured results, and limitations |
 | `test/test_alphazero_utils.py` | Representation, evaluation, search, network, learning, self-play, replay, training-loop, and checkpoint tests |
 | `test/test_docker_template.py` | Docker build/script checks and notebook execution using shared helpers |
 | `requirements.txt` | Project dependencies, PyTorch 2.6.0, and `pytest<9` for shared test hooks |
@@ -365,6 +368,66 @@ progress, so loading does not exactly resume a training run. The notebook
 checks identical predictions and deterministic PUCT policies after reloading.
 Its checkpoint lives outside the source tree in the displayed temporary path.
 
+## Evaluating Fixed Agents
+
+`EvaluationAgent` accepts `(game, state, rng)` and returns an integer legal
+move. The evaluation factories keep network parameters fixed and use no
+self-play noise or temperature sampling:
+
+| Factory | Behavior |
+| :--- | :--- |
+| `make_random_agent()` | Wrap the original uniform-random legal player |
+| `make_mcts_agent(num_simulations)` | Wrap the original rollout MCTS, retaining UCT constant `sqrt(2)` and its tie behavior |
+| `make_minimax_agent()` | Exact minimax through the original alpha-beta implementation, caching actions by game object and state |
+| `make_policy_agent(evaluator)` | Highest legal policy probability; lowest-index ties |
+| `make_search_agent(evaluator, action_size=..., num_simulations=...)` | PUCT with noise disabled, greedy visit selection, and lowest-index ties |
+
+Reference random/MCTS functions use Python's global RNG. Their serial adapter
+seeds each call from the supplied NumPy generator and restores the Python RNG
+state afterward, including on errors. Do not run these adapters concurrently
+with other Python global-RNG consumers. Exact search is practical here for
+Tic-Tac-Toe; it is not a scalable default for larger games. Cached game rules
+must remain unchanged.
+
+`evaluate_agent(game, agent, opponent, seeds=..., max_moves=...)` plays the
+candidate as X and then O for each distinct nonnegative seed. Each seed/seat
+pair derives two independent streams using `SeedSequence([seed, seat_index])`:
+one for the candidate and one for the opponent. Matching experiments therefore
+use the same opponent seed schedule, without coupling it to a candidate's
+random consumption. All moves are checked for legality. An unfinished game at
+the move limit raises rather than being scored as a draw.
+
+`EvaluationResult.games` retains seeds, seats, move sequences, terminal states,
+winners, and candidate-relative outcomes. `summary()` returns game count,
+wins, draws, losses, and `score_rate = (wins + 0.5 * draws) / games`.
+Use `summary(agent_player=1)` for X and `summary(agent_player=-1)` for O.
+
+```python
+candidate = rialzut.make_search_agent(
+    rialzut.NetworkEvaluator(restored_network), action_size=9, num_simulations=64
+)
+result = rialzut.evaluate_agent(
+    game, candidate, rialzut.make_random_agent(), seeds=list(range(10)), max_moves=9
+)
+print(result.summary())
+print(result.summary(agent_player=-1))
+```
+
+The notebook compares random play, uniform PUCT, original rollout MCTS, and
+untrained/trained policy-only and network-guided PUCT agents. Each faces common
+random and exact-play opponents, with ten games per seat and 64 simulations per
+move for search candidates. The trained model comes from the notebook's eight
+games and 24 updates; untrained controls use the same initial seed and width.
+All per-seat results and budgets are displayed. The
+[tutorial article](alphazero.tutorial.md) records the observed results.
+
+These are small descriptive experiments with one network initialization.
+Different seeds cannot vary a fully deterministic matchup, and repeated
+identical games are not independent evidence. Exact minimax also uses one tie
+convention; a draw against that opponent does not prove a candidate is unbeatable
+against every strategy. Equal simulation counts are not equal runtime or equal
+compute: rollout MCTS, neural PUCT, and exhaustive minimax do different work.
+
 ## Run Locally
 
 Use a checkout with the `helpers_root` submodule present. Run these commands
@@ -455,10 +518,11 @@ for additional script options.
 
 | Check | Result |
 | :--- | :--- |
-| Core tests in the local development environment | 106 passed: 93 existing tests and 13 replay/training/checkpoint tests |
-| Core tests in the CPU image | 106 passed with PyTorch 2.6.0+cpu |
+| Core tests in the local development environment | 119 passed: 106 existing tests and 13 evaluation/adapter/scoring tests |
+| Core tests in the CPU image | 119 passed with PyTorch 2.6.0+cpu |
 | Notebook execution in fresh local and Docker kernels | Passed |
 | Docker integration checks | Command and notebook execution passed; image build and shared shell checks passed previously |
+| Overall and per-seat evaluation tables | Local and Docker results match exactly |
 | Notebook schema | Valid |
 | Python formatting, shell syntax, and symlink targets | Passed |
 
@@ -479,8 +543,12 @@ collection/update ordering, finite metrics, parameter changes, optimizer
 continuation, and repeatable seeded runs. Checkpoint tests verify prediction
 and search round trips, independent CPU models, atomic replacement, and
 rejection of incompatible or nonfinite weights.
-The notebook executes uniform-prior search, supervised fitting, self-play,
-a small replay training run, and checkpoint reload with matching predictions.
+Evaluation tests cover known scoring, both seats, reference adapter equivalence,
+legal trajectories, separate role RNGs, reproducibility, deterministic inference,
+unchanged network state, exact-play draws, and move/seed validation.
+The notebook executes the complete implementation, compares seven candidates
+against two opponents, and reports budgets and limitations. Its overall and
+per-seat evaluation tables match between local and CPU Docker runs.
 
 The shared helpers emit deprecation warnings for `datetime.utcnow()` and the
 root pytest hook's legacy `path` argument. The latter is why this project's

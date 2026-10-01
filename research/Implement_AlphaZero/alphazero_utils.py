@@ -19,12 +19,14 @@ import research.Implement_AlphaZero.alphazero_utils as rialzut
 
 import collections
 import dataclasses
+import functools
 import logging
 import math
 import numbers
 import os
+import random
 import tempfile
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -34,6 +36,8 @@ from tqdm.auto import trange
 
 import helpers.hdbg as hdbg
 import research.Implement_MonteCarlo_Tree_Search_and_Alpha_Zero.game as rimtsaazg
+import research.Implement_MonteCarlo_Tree_Search_and_Alpha_Zero.mcts_utils as rimtsaazmu
+import research.Implement_MonteCarlo_Tree_Search_and_Alpha_Zero.search_algorithms_utils as rimtsaazsau
 
 _LOG = logging.getLogger(__name__)
 
@@ -1324,3 +1328,317 @@ def load_checkpoint(path: str) -> PolicyValueNetwork:
     )
     network.eval()
     return network
+
+
+# #############################################################################
+# Evaluation agents
+# #############################################################################
+
+
+EvaluationAgent = Callable[
+    [rimtsaazg.Game, rimtsaazg.State, np.random.Generator], rimtsaazg.Move
+]
+
+
+def _call_legacy_player(
+    player: Callable[[rimtsaazg.Game, rimtsaazg.State], rimtsaazg.Move],
+    game: rimtsaazg.Game,
+    state: rimtsaazg.State,
+    rng: np.random.Generator,
+) -> rimtsaazg.Move:
+    """
+    Seed a reference player and restore its Python global RNG after the call.
+
+    Reference random/MCTS players use Python's module-level RNG. Isolate their
+    calls without changing their algorithms. This adapter is for serial use;
+    it must not run concurrently with other Python global-RNG consumers.
+    """
+    previous_state = random.getstate()
+    try:
+        random.seed(int(rng.integers(0, 2**32)))
+        return player(game, state)
+    finally:
+        random.setstate(previous_state)
+
+
+def make_random_agent() -> EvaluationAgent:
+    """
+    Adapt the reference uniform-random legal player to explicit seeded use.
+
+    :return: serial evaluation agent consuming only its supplied random stream
+    """
+
+    def agent(
+        game: rimtsaazg.Game, state: rimtsaazg.State, rng: np.random.Generator
+    ) -> rimtsaazg.Move:
+        return _call_legacy_player(rimtsaazmu.random_player, game, state, rng)
+
+    return agent
+
+
+def make_mcts_agent(num_simulations: int) -> EvaluationAgent:
+    """
+    Adapt the original rollout MCTS at an explicit per-move simulation budget.
+
+    Keep its UCT constant sqrt(2), incoming-player values, random expansions,
+    rollouts, and most-visited move selection unchanged. Calls are serial.
+
+    :param num_simulations: positive number of reference MCTS simulations
+    :return: agent with seeded random expansion/rollout choices
+    """
+    hdbg.dassert_isinstance(num_simulations, int, "Budget must be an integer")
+    hdbg.dassert_lt(0, num_simulations, "MCTS needs a positive budget")
+    player = rimtsaazmu.make_mcts_player(num_simulations=num_simulations)
+
+    def agent(
+        game: rimtsaazg.Game, state: rimtsaazg.State, rng: np.random.Generator
+    ) -> rimtsaazg.Move:
+        return _call_legacy_player(player, game, state, rng)
+
+    return agent
+
+
+def make_minimax_agent() -> EvaluationAgent:
+    """
+    Adapt exact minimax using the reference alpha-beta implementation.
+
+    Cache selected actions by game object and state to reuse solved positions.
+    This is suitable for Tic-Tac-Toe; exhaustive search is not a practical
+    general baseline for larger games. Game rules must not change while cached.
+
+    :return: deterministic exact-play agent that consumes no random numbers
+    """
+    solve = functools.lru_cache(maxsize=10000)(rimtsaazsau.run_alpha_beta)
+
+    def agent(
+        game: rimtsaazg.Game, state: rimtsaazg.State, rng: np.random.Generator
+    ) -> rimtsaazg.Move:
+        return solve(game, state)
+
+    return agent
+
+
+def make_policy_agent(evaluator: PolicyValueEvaluator) -> EvaluationAgent:
+    """
+    Select the highest-probability legal action without search or sampling.
+
+    :param evaluator: fixed deterministic policy/value evaluator; value is unused
+    :return: greedy policy agent; equal probabilities choose the lowest index
+    """
+
+    def agent(
+        game: rimtsaazg.Game, state: rimtsaazg.State, rng: np.random.Generator
+    ) -> rimtsaazg.Move:
+        hdbg.dassert(
+            not game.is_terminal(state), "Cannot choose a terminal move"
+        )
+        prediction = evaluator(game, state)
+        mask = get_legal_action_mask(game, state, len(prediction.policy))
+        hdbg.dassert(mask.any(), "A move requires a legal action")
+        policy = normalize_policy(prediction.policy, mask)
+        return int(np.argmax(policy))
+
+    return agent
+
+
+def make_search_agent(
+    evaluator: PolicyValueEvaluator,
+    *,
+    action_size: int,
+    num_simulations: int,
+    exploration_constant: float = 1.0,
+) -> EvaluationAgent:
+    """
+    Build a greedy PUCT evaluation agent with root noise disabled.
+
+    :param evaluator: fixed deterministic evaluator, either uniform or learned
+    :param action_size: positive fixed action count
+    :param num_simulations: positive per-move simulation budget
+    :param exploration_constant: nonnegative finite PUCT weight
+    :return: deterministic agent selecting most-visited actions, lowest-index ties
+    """
+    hdbg.dassert_isinstance(action_size, int, "Action count must be an integer")
+    hdbg.dassert_lt(0, action_size, "Action count must be positive")
+    hdbg.dassert_isinstance(num_simulations, int, "Budget must be an integer")
+    hdbg.dassert_lt(0, num_simulations, "Search needs a positive budget")
+    hdbg.dassert(
+        np.isfinite(exploration_constant) and exploration_constant >= 0,
+        "Exploration must be finite and nonnegative",
+    )
+
+    def agent(
+        game: rimtsaazg.Game, state: rimtsaazg.State, rng: np.random.Generator
+    ) -> rimtsaazg.Move:
+        root = build_search_tree(
+            game,
+            state,
+            evaluator,
+            action_size=action_size,
+            num_simulations=num_simulations,
+            exploration_constant=exploration_constant,
+            root_noise_fraction=0.0,
+        )
+        policy = get_visit_policy(root, action_size, temperature=0.0)
+        return int(np.argmax(policy))
+
+    return agent
+
+
+# #############################################################################
+# Evaluation records and paired-seat matches
+# #############################################################################
+
+
+@dataclasses.dataclass(frozen=True)
+class EvaluationGame:
+    """
+    Record one complete game from the evaluated agent's perspective.
+
+    `agent_player` is +1 for X or -1 for O; `winner` uses game coordinates.
+    `outcome = winner * agent_player` is +1 for a win, 0 for a draw, -1 for
+    a loss. Moves start from the game's initial state; no training occurs.
+    """
+
+    seed: int
+    agent_player: int
+    winner: int
+    outcome: int
+    moves: Tuple[rimtsaazg.Move, ...]
+    final_state: rimtsaazg.State
+
+
+@dataclasses.dataclass
+class EvaluationResult:
+    """
+    Hold per-game evidence and summarize agent-relative wins, draws, and losses.
+    """
+
+    games: List[EvaluationGame]
+
+    def summary(
+        self, *, agent_player: Optional[int] = None
+    ) -> Dict[str, Union[int, float]]:
+        """
+        Count outcomes and score draws as one-half, optionally for one seat.
+
+        :param agent_player: +1 for X, -1 for O, or None to combine both seats
+        :return: games, wins, draws, losses, and score_rate = (wins + draws/2)/games
+        """
+        hdbg.dassert_in(
+            agent_player, (None, 1, -1), "Choose X, O, or both seats"
+        )
+        selected = [
+            g
+            for g in self.games
+            if agent_player is None or g.agent_player == agent_player
+        ]
+        hdbg.dassert(selected, "No completed games for this summary")
+        wins = sum(g.outcome == 1 for g in selected)
+        draws = sum(g.outcome == 0 for g in selected)
+        losses = sum(g.outcome == -1 for g in selected)
+        return {
+            "games": len(selected),
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "score_rate": (wins + 0.5 * draws) / len(selected),
+        }
+
+
+def evaluate_agent(
+    game: rimtsaazg.Game,
+    agent: EvaluationAgent,
+    opponent: EvaluationAgent,
+    *,
+    seeds: Sequence[int],
+    max_moves: int,
+) -> EvaluationResult:
+    """
+    Play two complete games per seed, evaluating the agent once in each seat.
+
+    For each seed, play as X then O. Independent per-role streams derive from
+    SeedSequence([seed, seat_index]). Matching seed/seat pairs across agents
+    receive the same opponent stream; an agent's random consumption cannot
+    advance its opponent's stream. Seeds affect stochastic agents only: repeated
+    deterministic matches can be identical and are not independent evidence.
+
+    Agents must be fixed during evaluation. This runner does not update models,
+    add self-play noise, sample training targets, or alter global RNGs. Use the
+    supplied factories for noise-free greedy network/PUCT evaluation. Legacy
+    random/MCTS adapters temporarily isolate Python's RNG and require serial use.
+
+    :param game: terminating two-player zero-sum rules with players +1 and -1
+    :param agent: agent to measure, accepting (game, state, its_rng)
+    :param opponent: fixed reference agent with the same signature
+    :param seeds: nonempty sequence of distinct nonnegative integer seeds
+    :param max_moves: positive game-length cap; unfinished games raise, not draw
+    :return: complete moves/outcomes with summaries available overall and by seat
+    """
+    hdbg.dassert_isinstance(max_moves, int, "Move limit must be an integer")
+    hdbg.dassert_lt(0, max_moves, "Move limit must be positive")
+    seeds = list(seeds)
+    hdbg.dassert(seeds, "Evaluation requires at least one seed")
+    for seed in seeds:
+        hdbg.dassert_isinstance(
+            seed, numbers.Integral, "Seeds must be integers"
+        )
+        hdbg.dassert_lte(0, seed, "Seeds must be nonnegative")
+    hdbg.dassert_eq(
+        len(set(seeds)), len(seeds), "Use distinct evaluation seeds"
+    )
+    hdbg.dassert(
+        not game.is_terminal(game.get_initial_state()),
+        "Evaluation needs a nonterminal initial state",
+    )
+    records = []
+    for seed in seeds:
+        for seat_index, agent_player in enumerate((1, -1)):
+            streams = np.random.SeedSequence([int(seed), seat_index]).spawn(2)
+            agent_rng, opponent_rng = [
+                np.random.default_rng(s) for s in streams
+            ]
+            state = game.get_initial_state()
+            moves = []
+            while not game.is_terminal(state):
+                hdbg.dassert_lt(
+                    len(moves),
+                    max_moves,
+                    "Evaluation exceeded max_moves before terminality",
+                )
+                player = game.get_current_player(state)
+                hdbg.dassert_in(
+                    player, (-1, 1), "Game must use players +1 and -1"
+                )
+                actor, rng = (
+                    (agent, agent_rng)
+                    if player == agent_player
+                    else (opponent, opponent_rng)
+                )
+                move = actor(game, state, rng)
+                hdbg.dassert_isinstance(
+                    move,
+                    numbers.Integral,
+                    "Agent must return an integer action",
+                )
+                hdbg.dassert_in(
+                    move,
+                    game.get_legal_moves(state),
+                    "Agent returned an illegal move",
+                )
+                moves.append(int(move))
+                state = game.apply_move(state, int(move))
+            winner = game.get_winner(state)
+            hdbg.dassert_in(
+                winner, (-1, 0, 1), "Winner must identify a player or draw"
+            )
+            records.append(
+                EvaluationGame(
+                    int(seed),
+                    agent_player,
+                    winner,
+                    winner * agent_player,
+                    tuple(moves),
+                    state,
+                )
+            )
+    return EvaluationResult(records)
